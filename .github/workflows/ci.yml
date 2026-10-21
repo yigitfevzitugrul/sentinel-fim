@@ -1,0 +1,17 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        toolchain: ["1.99.1", "1.88.0"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal -c rustfmt,clippy && rustup override set ${{ matrix.toolchain }}
+      - run: cargo fmt --check
+        if: matrix.toolchain == '1.99.1'
+      - run: cargo clippy --all-targets --locked -- -D warnings
+        if: matrix.toolchain == '1.99.1'
+      - run: cargo test --locked

@@ -127,10 +127,8 @@ impl Baseline {
     pub fn to_bytes(&self, signer: Option<&SigningKey>) -> Vec<u8> {
         let body = serde_json::to_string_pretty(&BodyRef::from(self))
             .expect("baseline body is always serializable");
-        envelope(
-            &body,
-            signer.map(|key| BaselineSignature::create(key, body.as_bytes())),
-        )
+        let signature = signer.map(|key| BaselineSignature::create(key, body.as_bytes()));
+        envelope(body, signature)
     }
 
     /// Parses and checks the file format.
@@ -282,8 +280,9 @@ struct EnvelopeIn<'a> {
     body: &'a RawValue,
 }
 
-fn envelope(body: &str, signature: Option<BaselineSignature>) -> Vec<u8> {
-    let raw = RawValue::from_string(body.to_owned()).expect("body is valid JSON");
+/// Takes the body by value: it can be large, and is moved, not copied.
+fn envelope(body: String, signature: Option<BaselineSignature>) -> Vec<u8> {
+    let raw = RawValue::from_string(body).expect("body is valid JSON");
     envelope_raw(&raw, signature)
 }
 
@@ -490,7 +489,7 @@ mod tests {
     /// Builds a file whose checksum is valid for an arbitrary body, as an
     /// attacker without the signing key could.
     fn forge(body: &str) -> Vec<u8> {
-        envelope(body, None)
+        envelope(body.to_owned(), None)
     }
 
     #[test]
@@ -596,7 +595,7 @@ mod tests {
         let sig_end = signed[sig_start..].find("},").unwrap() + sig_start + 1;
         let signature: BaselineSignature =
             serde_json::from_str(&signed[sig_start..sig_end]).unwrap();
-        let forged = envelope(&body, Some(signature));
+        let forged = envelope(body, Some(signature));
 
         let err = Baseline::from_bytes(
             &forged,
