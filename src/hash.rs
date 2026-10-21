@@ -8,14 +8,18 @@
 use std::fmt;
 use std::io::{self, Read};
 
+use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
+
+use crate::hex;
 
 /// Read buffer size. Large enough to keep syscall overhead low, small enough
 /// to be irrelevant for memory use.
 const BUFFER_SIZE: usize = 64 * 1024;
 
 /// Supported digest algorithms.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Algorithm {
     /// SHA-256 (FIPS 180-4). The default and the interoperable choice.
     #[default]
@@ -57,10 +61,15 @@ impl fmt::Display for Algorithm {
 /// Every algorithm we support (and BLAKE3, the planned candidate) produces 32
 /// bytes, so a fixed-size array avoids a heap allocation per file. The
 /// algorithm itself is tracked by the caller, not by each digest.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Digest([u8; 32]);
 
 impl Digest {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Digest(bytes)
+    }
+
     /// Raw digest bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -71,6 +80,20 @@ impl Digest {
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl From<Digest> for String {
+    fn from(digest: Digest) -> Self {
+        digest.to_string()
+    }
+}
+
+impl TryFrom<String> for Digest {
+    type Error = hex::HexError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        hex::decode_array(&text).map(Digest)
     }
 }
 
@@ -285,6 +308,26 @@ mod tests {
     fn algorithm_name_and_default() {
         assert_eq!(Algorithm::default(), Algorithm::Sha256);
         assert_eq!(Algorithm::Sha256.to_string(), "sha256");
+    }
+
+    #[test]
+    fn serde_forms() {
+        assert_eq!(
+            serde_json::to_string(&Algorithm::Sha256).unwrap(),
+            r#""sha256""#
+        );
+        let d = Algorithm::Sha256
+            .hash_reader(&mut &b"abc"[..])
+            .unwrap()
+            .digest;
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(
+            json,
+            r#""ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad""#
+        );
+        assert_eq!(serde_json::from_str::<Digest>(&json).unwrap(), d);
+        assert!(serde_json::from_str::<Digest>(r#""abcd""#).is_err());
+        assert!(serde_json::from_str::<Algorithm>(r#""md5""#).is_err());
     }
 
     #[test]

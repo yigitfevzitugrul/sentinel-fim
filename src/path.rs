@@ -15,9 +15,13 @@
 //!
 //! The textual form always uses `/` as separator, on every platform.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::hex;
 
 #[cfg(not(any(unix, windows)))]
 compile_error!("sentinel-fim supports only Unix and Windows targets");
@@ -30,15 +34,20 @@ const SEPARATOR: char = '/';
 /// The only ways to obtain one are the validating constructors, so holding a
 /// `RelPath` is proof that the path is valid. Ordering is component-wise
 /// (`a/b` sorts before `a-b`), which keeps baselines deterministic.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "PathRepr", into = "PathRepr")]
 pub struct RelPath(PathBuf);
 
-/// Serializable form of a [`RelPath`].
+/// Serializable form of a [`RelPath`] or of an arbitrary OS path.
 ///
 /// `Utf8` is used whenever possible. The raw variants exist only for names
 /// that are not valid Unicode, and are only accepted on the platform that
 /// produced them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// In JSON, `Utf8` is a plain string; the raw variants are
+/// `{"unix_bytes": "<hex>"}` and `{"windows_wide": "<hex of big-endian u16>"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ReprWire", into = "ReprWire")]
 pub enum PathRepr {
     /// `/`-separated UTF-8 text.
     Utf8(String),
@@ -115,6 +124,12 @@ impl RelPath {
     pub fn names(&self) -> impl Iterator<Item = &OsStr> {
         // The constructors guarantee every component is `Normal`.
         self.0.components().map(Component::as_os_str)
+    }
+
+    /// `true` if `self` is `ancestor` or lies below it (component-wise, so
+    /// `a-b` is not below `a`).
+    pub fn starts_with(&self, ancestor: &RelPath) -> bool {
+        self.0.starts_with(&ancestor.0)
     }
 
     /// Converts to the serializable form, preferring UTF-8.
@@ -199,6 +214,118 @@ impl RelPath {
     }
 }
 
+impl PathRepr {
+    /// Opaque, lossless form of any OS string (for example a symlink target
+    /// or a scan root). Unlike a [`RelPath`], it is not split or validated.
+    pub fn from_os_str(value: &OsStr) -> Self {
+        match value.to_str() {
+            Some(text) => PathRepr::Utf8(text.to_owned()),
+            None => raw_os_repr(value),
+        }
+    }
+
+    /// Inverse of [`PathRepr::from_os_str`].
+    ///
+    /// # Errors
+    ///
+    /// For a raw encoding of another platform, or one that is valid UTF-8.
+    pub fn to_os_string(&self) -> Result<OsString, RelPathError> {
+        let value = match self {
+            PathRepr::Utf8(text) => return Ok(OsString::from(text)),
+            raw => os_string_from_raw(raw)?,
+        };
+        if value.to_str().is_some() {
+            return Err(RelPathError::NonCanonicalEncoding);
+        }
+        Ok(value)
+    }
+}
+
+#[cfg(unix)]
+fn raw_os_repr(value: &OsStr) -> PathRepr {
+    use std::os::unix::ffi::OsStrExt;
+    PathRepr::UnixBytes(value.as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn raw_os_repr(value: &OsStr) -> PathRepr {
+    use std::os::windows::ffi::OsStrExt;
+    PathRepr::WindowsWide(value.encode_wide().collect())
+}
+
+#[cfg(unix)]
+fn os_string_from_raw(repr: &PathRepr) -> Result<OsString, RelPathError> {
+    use std::os::unix::ffi::OsStringExt;
+    match repr {
+        PathRepr::UnixBytes(bytes) => Ok(OsString::from_vec(bytes.clone())),
+        PathRepr::WindowsWide(_) => Err(RelPathError::ForeignEncoding("Windows")),
+        PathRepr::Utf8(text) => Ok(OsString::from(text)),
+    }
+}
+
+#[cfg(windows)]
+fn os_string_from_raw(repr: &PathRepr) -> Result<OsString, RelPathError> {
+    use std::os::windows::ffi::OsStringExt;
+    match repr {
+        PathRepr::WindowsWide(units) => Ok(OsString::from_wide(units)),
+        PathRepr::UnixBytes(_) => Err(RelPathError::ForeignEncoding("Unix")),
+        PathRepr::Utf8(text) => Ok(OsString::from(text)),
+    }
+}
+
+impl From<RelPath> for PathRepr {
+    fn from(path: RelPath) -> Self {
+        path.to_repr()
+    }
+}
+
+impl TryFrom<PathRepr> for RelPath {
+    type Error = RelPathError;
+
+    fn try_from(repr: PathRepr) -> Result<Self, Self::Error> {
+        RelPath::from_repr(&repr)
+    }
+}
+
+/// JSON shape of a [`PathRepr`].
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum ReprWire {
+    Text(String),
+    Raw(RawWire),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawWire {
+    UnixBytes(String),
+    WindowsWide(String),
+}
+
+impl From<PathRepr> for ReprWire {
+    fn from(repr: PathRepr) -> Self {
+        match repr {
+            PathRepr::Utf8(text) => ReprWire::Text(text),
+            PathRepr::UnixBytes(bytes) => ReprWire::Raw(RawWire::UnixBytes(hex::encode(&bytes))),
+            PathRepr::WindowsWide(units) => {
+                ReprWire::Raw(RawWire::WindowsWide(hex::encode_u16(&units)))
+            }
+        }
+    }
+}
+
+impl TryFrom<ReprWire> for PathRepr {
+    type Error = hex::HexError;
+
+    fn try_from(wire: ReprWire) -> Result<Self, Self::Error> {
+        Ok(match wire {
+            ReprWire::Text(text) => PathRepr::Utf8(text),
+            ReprWire::Raw(RawWire::UnixBytes(h)) => PathRepr::UnixBytes(hex::decode(&h)?),
+            ReprWire::Raw(RawWire::WindowsWide(h)) => PathRepr::WindowsWide(hex::decode_u16(&h)?),
+        })
+    }
+}
+
 /// Validates one name and appends it.
 fn push_name(path: &mut PathBuf, name: &OsStr) -> Result<(), RelPathError> {
     if name.is_empty() {
@@ -254,16 +381,40 @@ impl fmt::Display for RelPath {
             if i > 0 {
                 f.write_char(SEPARATOR)?;
             }
-            for c in name.to_string_lossy().chars() {
-                if c.is_control() || is_bidi_control(c) {
-                    write!(f, "{}", c.escape_unicode())?;
-                } else {
-                    f.write_char(c)?;
-                }
-            }
+            write_escaped(f, &name.to_string_lossy())?;
         }
         Ok(())
     }
+}
+
+/// Writes `text` with control and bidi characters escaped as `\u{..}`.
+pub fn write_escaped(out: &mut impl fmt::Write, text: &str) -> fmt::Result {
+    for c in text.chars() {
+        if c.is_control() || is_bidi_control(c) {
+            write!(out, "{}", c.escape_unicode())?;
+        } else {
+            out.write_char(c)?;
+        }
+    }
+    Ok(())
+}
+
+/// Safe human-readable form of any OS path (e.g. a root or a link target).
+/// On Windows the `\\?\` verbatim prefix is hidden.
+pub fn display_os_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let shown = if cfg!(windows) {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else {
+            text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+        }
+    } else {
+        text.into_owned()
+    };
+    let mut out = String::with_capacity(shown.len());
+    write_escaped(&mut out, &shown).expect("writing to a String cannot fail");
+    out
 }
 
 #[cfg(test)]
@@ -482,9 +633,88 @@ mod tests {
     }
 
     #[test]
+    fn os_path_display_is_safe() {
+        assert_eq!(display_os_path(Path::new("a\u{1b}b")), r"a\u{1b}b");
+        #[cfg(windows)]
+        {
+            assert_eq!(display_os_path(Path::new(r"\\?\C:\data")), r"C:\data");
+            assert_eq!(
+                display_os_path(Path::new(r"\\?\UNC\srv\share")),
+                r"\\srv\share"
+            );
+        }
+    }
+
+    #[test]
     fn ordering_is_component_wise() {
         let mut paths = vec![rel("a-b"), rel("a/b"), rel("a")];
         paths.sort();
         assert_eq!(paths, vec![rel("a"), rel("a/b"), rel("a-b")]);
+    }
+
+    #[test]
+    fn starts_with_is_component_wise() {
+        assert!(rel("a/b/c").starts_with(&rel("a/b")));
+        assert!(rel("a/b").starts_with(&rel("a/b")));
+        assert!(!rel("a-b/c").starts_with(&rel("a")));
+        assert!(!rel("a").starts_with(&rel("a/b")));
+    }
+
+    #[test]
+    fn json_utf8_is_a_plain_string() {
+        let p = rel("dir/dosya adı.txt");
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, r#""dir/dosya adı.txt""#);
+        assert_eq!(serde_json::from_str::<RelPath>(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn json_rejects_traversal_and_bad_hex() {
+        for bad in [r#""../etc/passwd""#, r#""/abs""#, r#""a//b""#, r#""""#] {
+            assert!(serde_json::from_str::<RelPath>(bad).is_err(), "{bad}");
+        }
+        assert!(serde_json::from_str::<RelPath>(r#"{"unix_bytes":"zz"}"#).is_err());
+        assert!(serde_json::from_str::<RelPath>(r#"{"bogus":"00"}"#).is_err());
+        assert!(serde_json::from_str::<RelPath>("42").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_raw_unix_round_trips() {
+        use std::os::unix::ffi::OsStrExt;
+        let p = RelPath::new(Path::new(OsStr::from_bytes(b"x/\xff"))).unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, r#"{"unix_bytes":"782fff"}"#);
+        assert_eq!(serde_json::from_str::<RelPath>(&json).unwrap(), p);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn json_raw_windows_round_trips() {
+        use std::os::windows::ffi::OsStringExt;
+        let name = OsString::from_wide(&[0x78, 0xD800]);
+        let p = RelPath::new(Path::new(&name)).unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, r#"{"windows_wide":"0078d800"}"#);
+        assert_eq!(serde_json::from_str::<RelPath>(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn opaque_os_repr_round_trips() {
+        let target = OsStr::new("../outside/target");
+        let repr = PathRepr::from_os_str(target);
+        assert_eq!(repr, PathRepr::Utf8("../outside/target".into()));
+        assert_eq!(repr.to_os_string().unwrap(), target);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = OsStr::from_bytes(b"/tmp/\xff");
+            assert_eq!(PathRepr::from_os_str(raw).to_os_string().unwrap(), raw);
+            assert_eq!(
+                PathRepr::UnixBytes(b"ok".to_vec()).to_os_string(),
+                Err(RelPathError::NonCanonicalEncoding)
+            );
+        }
     }
 }

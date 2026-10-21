@@ -11,10 +11,23 @@ keywords = ["fim", "integrity", "security", "hash", "monitor"]
 categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+ed25519-dalek = "3"
+getrandom = "0.4"
+globset = "0.4"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
 # Default features (alloc, oid) are not needed; keep the dependency tree small.
 sha2 = { version = "0.11", default-features = false }
+tempfile = "3"
 thiserror = "2"
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }
 walkdir = "2"
+zeroize = "1"
 
 [lints.rust]
 # A security tool has no business using unsafe code.
@@ -24,4 +37,5 @@ unsafe_code = "forbid"
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"
+assert_cmd = "2"
+predicates = "3"

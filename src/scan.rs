@@ -1,10 +1,11 @@
 //! Walking a directory tree and recording the state of every entry.
 //!
-//! Policy (see the threat model):
+//! Policy (see `docs/THREAT_MODEL.md`):
 //!
-//! * Symbolic links are **never followed**; the link itself is recorded with
-//!   its target. On Windows this includes junctions and other name-surrogate
-//!   reparse points.
+//! * By default symbolic links are **not followed**; the link itself is
+//!   recorded with its target. On Windows this includes junctions and other
+//!   name-surrogate reparse points. Following is an explicit opt-in
+//!   ([`SymlinkPolicy::Follow`]).
 //! * Special files (FIFOs, sockets, devices) are recorded by type and never
 //!   opened: opening a FIFO can block forever.
 //! * Regular files are opened without following links (and, on Unix, without
@@ -13,7 +14,7 @@
 //!   after the directory was listed.
 //! * A file whose metadata changes while it is read is reported, not hashed.
 //! * Per-entry problems become [`ScanIssue`]s and never abort the scan; only
-//!   an unusable root is fatal.
+//!   an unusable root or an invalid policy is fatal.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -21,40 +22,126 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::hash::{Algorithm, Digest};
-use crate::path::{RelPath, RelPathError};
+use crate::path::{PathRepr, RelPath, RelPathError};
 
-/// Settings for a scan.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ScanOptions {
+/// What to do with symbolic links (and Windows junctions).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SymlinkPolicy {
+    /// Record the link and its target; never look behind it. Safe default.
+    #[default]
+    Record,
+    /// Treat links as what they point to. Links may lead outside the root,
+    /// and broken links are reported as issues. Loops are detected.
+    Follow,
+}
+
+/// Everything that determines what a scan records. Stored in the baseline,
+/// so a later scan uses exactly the rules the baseline was created with.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanPolicy {
     pub algorithm: Algorithm,
+    pub symlinks: SymlinkPolicy,
+    /// Glob patterns, see [`ScanPolicy::validate`] for the syntax.
+    pub exclude: Vec<String>,
+    /// Do not descend into other file systems (mount points).
+    pub one_file_system: bool,
+    /// Files larger than this are reported as issues instead of hashed.
+    pub max_file_size: Option<u64>,
+}
+
+impl ScanPolicy {
+    /// Checks the exclude patterns.
+    ///
+    /// Patterns always use `/` as separator. A pattern without `/` matches an
+    /// entry *name* at any depth (`*.log`). A pattern containing `/` matches
+    /// the path relative to the root (`build/**`, `logs/app.log`); a leading
+    /// `/` is allowed and ignored. `*` never crosses `/`, `**` does.
+    /// Excluding a directory excludes everything below it.
+    ///
+    /// # Errors
+    ///
+    /// For empty patterns, `\`, `..` components and invalid glob syntax.
+    pub fn validate(&self) -> Result<(), ScanError> {
+        Excludes::new(&self.exclude).map(|_| ())
+    }
 }
 
 /// Recorded state of one directory entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Record {
     File {
         size: u64,
         digest: Digest,
     },
-    Directory,
+    Directory {},
     /// The link itself; its target is stored, not followed.
     Symlink {
+        #[serde(with = "os_path")]
         target: PathBuf,
     },
-    Special(SpecialKind),
+    Special {
+        kind: SpecialKind,
+    },
+}
+
+impl Record {
+    /// Short type name used in reports.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Record::File { .. } => "file",
+            Record::Directory {} => "directory",
+            Record::Symlink { .. } => "symlink",
+            Record::Special { kind } => kind.name(),
+        }
+    }
 }
 
 /// Non-regular, non-directory, non-link entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SpecialKind {
     Fifo,
     Socket,
     BlockDevice,
     CharDevice,
     Unknown,
+}
+
+impl SpecialKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            SpecialKind::Fifo => "fifo",
+            SpecialKind::Socket => "socket",
+            SpecialKind::BlockDevice => "block_device",
+            SpecialKind::CharDevice => "char_device",
+            SpecialKind::Unknown => "special",
+        }
+    }
+}
+
+/// Serde adapter storing any OS path losslessly through [`PathRepr`].
+pub(crate) mod os_path {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+        PathRepr::from_os_str(path.as_os_str()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+        PathRepr::deserialize(deserializer)?
+            .to_os_string()
+            .map(PathBuf::from)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// One successfully recorded entry.
@@ -74,6 +161,13 @@ pub struct ScanIssue {
     pub kind: IssueKind,
 }
 
+impl ScanIssue {
+    /// `true` if this issue leaves the state of `path` unknown.
+    pub fn covers(&self, path: &RelPath) -> bool {
+        self.path.as_ref().is_none_or(|p| path.starts_with(p))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IssueKind {
     #[error("{0}")]
@@ -82,6 +176,8 @@ pub enum IssueKind {
     ChangedDuringScan,
     #[error("entry was replaced by a different type while being read")]
     TypeChangedDuringScan,
+    #[error("file size {size} exceeds the limit of {limit} bytes")]
+    TooLarge { size: u64, limit: u64 },
     #[error("unsupported path {path:?}: {source}")]
     InvalidPath { path: String, source: RelPathError },
 }
@@ -97,14 +193,13 @@ pub enum ScanError {
     RootUnavailable { path: PathBuf, source: io::Error },
     #[error("scan root {} is not a directory", .path.display())]
     RootNotDirectory { path: PathBuf },
+    #[error("invalid exclude pattern {pattern:?}: {reason}")]
+    InvalidExclude { pattern: String, reason: String },
 }
 
-/// Result of a full scan.
-#[derive(Debug)]
+/// Result of a scan.
+#[derive(Debug, Default)]
 pub struct Snapshot {
-    /// Canonical root that was scanned.
-    pub root: PathBuf,
-    pub algorithm: Algorithm,
     pub entries: BTreeMap<RelPath, Record>,
     pub issues: Vec<ScanIssue>,
 }
@@ -114,52 +209,46 @@ impl Snapshot {
     pub fn is_complete(&self) -> bool {
         self.issues.is_empty()
     }
+
+    fn collect(items: impl Iterator<Item = Result<Entry, ScanIssue>>) -> Self {
+        let mut snapshot = Snapshot::default();
+        for item in items {
+            match item {
+                Ok(entry) => {
+                    snapshot.entries.insert(entry.path, entry.record);
+                }
+                Err(issue) => snapshot.issues.push(issue),
+            }
+        }
+        snapshot
+    }
 }
 
-/// Scans `root` completely and collects the result.
+/// Scans `root` completely with `policy`.
 ///
 /// # Errors
 ///
-/// Only if the root itself cannot be used; problems with individual entries
-/// are reported in [`Snapshot::issues`].
-pub fn scan(root: &Path, options: ScanOptions) -> Result<Snapshot, ScanError> {
-    let walk = Walk::new(root, options)?;
-    let root = walk.root().to_path_buf();
-
-    let mut entries = BTreeMap::new();
-    let mut issues = Vec::new();
-    for item in walk {
-        match item {
-            Ok(entry) => {
-                entries.insert(entry.path, entry.record);
-            }
-            Err(issue) => issues.push(issue),
-        }
-    }
-
-    Ok(Snapshot {
-        root,
-        algorithm: options.algorithm,
-        entries,
-        issues,
-    })
+/// Only if the root is unusable or the policy invalid; problems with
+/// individual entries are reported in [`Snapshot::issues`].
+pub fn scan(root: &Path, policy: &ScanPolicy) -> Result<Snapshot, ScanError> {
+    Ok(Scanner::new(root, policy.clone())?.scan())
 }
 
-/// Lazy scan: yields one result per entry, in a deterministic order.
-///
-/// Memory use is bounded by the directory depth, not by the number of files,
-/// so callers that do not need the whole [`Snapshot`] can stream.
-pub struct Walk {
+/// A validated root and policy, ready to scan any number of times.
+#[derive(Debug)]
+pub struct Scanner {
     root: PathBuf,
-    algorithm: Algorithm,
-    inner: walkdir::IntoIter,
+    policy: ScanPolicy,
+    excludes: Excludes,
 }
 
-impl Walk {
+impl Scanner {
     /// # Errors
     ///
-    /// If `root` does not exist, cannot be resolved, or is not a directory.
-    pub fn new(root: &Path, options: ScanOptions) -> Result<Self, ScanError> {
+    /// If `root` does not exist, cannot be resolved, or is not a directory,
+    /// or if an exclude pattern is invalid.
+    pub fn new(root: &Path, policy: ScanPolicy) -> Result<Self, ScanError> {
+        let excludes = Excludes::new(&policy.exclude)?;
         // Resolves the operator-supplied root once (following links there is
         // an explicit choice of the operator). On Windows this yields a
         // `\\?\` verbatim path, which disables Win32 name normalization such
@@ -172,46 +261,79 @@ impl Walk {
         if !root.is_dir() {
             return Err(ScanError::RootNotDirectory { path: root });
         }
-
-        let inner = WalkDir::new(&root)
-            .follow_links(false)
-            .min_depth(1)
-            .sort_by_file_name()
-            .into_iter();
-
-        Ok(Walk {
+        Ok(Scanner {
             root,
-            algorithm: options.algorithm,
-            inner,
+            policy,
+            excludes,
         })
     }
 
-    /// Canonical root being walked.
+    /// Canonical root.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    fn visit(&self, entry: &walkdir::DirEntry) -> Result<Entry, ScanIssue> {
-        let path = RelPath::from_root(&self.root, entry.path()).map_err(|source| ScanIssue {
-            path: None,
-            kind: IssueKind::InvalidPath {
-                path: entry.path().to_string_lossy().into_owned(),
-                source,
-            },
-        })?;
+    pub fn policy(&self) -> &ScanPolicy {
+        &self.policy
+    }
 
-        // The type comes from the directory listing and does not follow links.
+    /// Lazy scan of the whole tree, in a deterministic order. Memory use is
+    /// bounded by the directory depth, not by the number of files.
+    pub fn walk(&self) -> Walk<'_> {
+        Walk::new(self, &self.root, 1)
+    }
+
+    /// Full scan.
+    pub fn scan(&self) -> Snapshot {
+        Snapshot::collect(self.walk())
+    }
+
+    /// Scans `path` and everything below it. The result is empty if the path
+    /// does not exist or is excluded.
+    pub fn scan_subtree(&self, path: &RelPath) -> Snapshot {
+        if self.is_excluded(path) {
+            return Snapshot::default();
+        }
+        let absolute = path.resolve(&self.root);
+        match fs::symlink_metadata(&absolute) {
+            Ok(_) => Snapshot::collect(Walk::new(self, &absolute, 0)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Snapshot::default(),
+            Err(e) => Snapshot {
+                entries: BTreeMap::new(),
+                issues: vec![ScanIssue {
+                    path: Some(path.clone()),
+                    kind: IssueKind::Io(e),
+                }],
+            },
+        }
+    }
+
+    /// `true` if `path` or one of its ancestors matches an exclude pattern.
+    pub fn is_excluded(&self, path: &RelPath) -> bool {
+        let mut prefix = PathBuf::new();
+        path.names().any(|name| {
+            prefix.push(name);
+            // Every prefix of a valid RelPath is a valid RelPath.
+            RelPath::new(&prefix).is_ok_and(|p| self.excludes.matches(&p))
+        })
+    }
+
+    fn visit(&self, entry: &walkdir::DirEntry, path: RelPath) -> Result<Entry, ScanIssue> {
+        // From the directory listing; for `Record` it describes the entry
+        // itself, for `Follow` the link target.
         let file_type = entry.file_type();
         let record = if file_type.is_symlink() {
             fs::read_link(entry.path())
                 .map(|target| Record::Symlink { target })
                 .map_err(IssueKind::Io)
         } else if file_type.is_dir() {
-            Ok(Record::Directory)
+            Ok(Record::Directory {})
         } else if file_type.is_file() {
-            hash_file(entry.path(), self.algorithm)
+            hash_file(entry.path(), &self.policy)
         } else {
-            Ok(Record::Special(special_kind(file_type)))
+            Ok(Record::Special {
+                kind: special_kind(file_type),
+            })
         };
 
         match record {
@@ -222,12 +344,32 @@ impl Walk {
             }),
         }
     }
+}
+
+/// Iterator over the entries of a [`Scanner`].
+pub struct Walk<'a> {
+    scanner: &'a Scanner,
+    inner: walkdir::IntoIter,
+}
+
+impl<'a> Walk<'a> {
+    fn new(scanner: &'a Scanner, start: &Path, min_depth: usize) -> Self {
+        let follow = scanner.policy.symlinks == SymlinkPolicy::Follow;
+        let inner = WalkDir::new(start)
+            .follow_links(follow)
+            .follow_root_links(follow)
+            .same_file_system(scanner.policy.one_file_system)
+            .min_depth(min_depth)
+            .sort_by_file_name()
+            .into_iter();
+        Walk { scanner, inner }
+    }
 
     fn walk_issue(&self, error: walkdir::Error) -> ScanIssue {
         // A missing path or the root itself maps to `None`.
         let path = error
             .path()
-            .and_then(|p| RelPath::from_root(&self.root, p).ok());
+            .and_then(|p| RelPath::from_root(&self.scanner.root, p).ok());
         ScanIssue {
             path,
             kind: IssueKind::Io(error.into()),
@@ -235,29 +377,113 @@ impl Walk {
     }
 }
 
-impl Iterator for Walk {
+impl Iterator for Walk<'_> {
     type Item = Result<Entry, ScanIssue>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // `?` on an `Option`: the walk is over when walkdir is.
-        let item = match self.inner.next()? {
-            Ok(entry) => self.visit(&entry),
-            Err(error) => Err(self.walk_issue(error)),
+        loop {
+            let entry = match self.inner.next()? {
+                Ok(entry) => entry,
+                Err(error) => return Some(Err(self.walk_issue(error))),
+            };
+            let path = match RelPath::from_root(&self.scanner.root, entry.path()) {
+                Ok(path) => path,
+                Err(source) => {
+                    return Some(Err(ScanIssue {
+                        path: None,
+                        kind: IssueKind::InvalidPath {
+                            path: entry.path().to_string_lossy().into_owned(),
+                            source,
+                        },
+                    }));
+                }
+            };
+            if self.scanner.excludes.matches(&path) {
+                if entry.file_type().is_dir() {
+                    self.inner.skip_current_dir();
+                }
+                continue;
+            }
+            return Some(self.scanner.visit(&entry, path));
+        }
+    }
+}
+
+/// Compiled exclude patterns.
+#[derive(Debug)]
+struct Excludes {
+    /// Patterns without `/`, matched against the entry name.
+    by_name: GlobSet,
+    /// Patterns with `/`, matched against the root-relative path.
+    by_path: GlobSet,
+}
+
+impl Excludes {
+    fn new(patterns: &[String]) -> Result<Self, ScanError> {
+        let mut by_name = GlobSetBuilder::new();
+        let mut by_path = GlobSetBuilder::new();
+        for pattern in patterns {
+            let invalid = |reason: &str| ScanError::InvalidExclude {
+                pattern: pattern.clone(),
+                reason: reason.to_owned(),
+            };
+            let trimmed = pattern.trim_start_matches('/').trim_end_matches('/');
+            if trimmed.is_empty() {
+                return Err(invalid("pattern is empty"));
+            }
+            if pattern.contains('\\') {
+                return Err(invalid("use '/' as separator; '\\' is not allowed"));
+            }
+            if trimmed.split('/').any(|part| part == ".." || part == ".") {
+                return Err(invalid("'.' and '..' components are not allowed"));
+            }
+            let glob = GlobBuilder::new(trimmed)
+                .literal_separator(true)
+                .backslash_escape(false)
+                .build()
+                .map_err(|e| invalid(&e.kind().to_string()))?;
+            if pattern.trim_end_matches('/').contains('/') {
+                by_path.add(glob);
+            } else {
+                by_name.add(glob);
+            }
+        }
+        let build = |builder: GlobSetBuilder| {
+            builder.build().map_err(|e| ScanError::InvalidExclude {
+                pattern: e.glob().unwrap_or_default().to_owned(),
+                reason: e.kind().to_string(),
+            })
         };
-        Some(item)
+        Ok(Excludes {
+            by_name: build(by_name)?,
+            by_path: build(by_path)?,
+        })
+    }
+
+    fn matches(&self, path: &RelPath) -> bool {
+        let name = path.names().last().map(Path::new);
+        name.is_some_and(|n| self.by_name.is_match(n)) || self.by_path.is_match(path.as_path())
     }
 }
 
 /// Hashes a regular file, guarding against swaps and concurrent changes.
-fn hash_file(path: &Path, algorithm: Algorithm) -> Result<Record, IssueKind> {
-    let mut file = open_regular(path)?;
+fn hash_file(path: &Path, policy: &ScanPolicy) -> Result<Record, IssueKind> {
+    let mut file = open_regular(path, policy.symlinks)?;
 
     let before = file.metadata()?;
     if !before.is_file() {
         return Err(IssueKind::TypeChangedDuringScan);
     }
+    if let Some(limit) = policy.max_file_size
+        && before.len() > limit
+    {
+        return Err(IssueKind::TooLarge {
+            size: before.len(),
+            limit,
+        });
+    }
 
-    let output = algorithm.hash_reader(&mut file)?;
+    let output = policy.algorithm.hash_reader(&mut file)?;
 
     let after = file.metadata()?;
     if !is_stable(
@@ -274,19 +500,24 @@ fn hash_file(path: &Path, algorithm: Algorithm) -> Result<Record, IssueKind> {
     })
 }
 
-/// Opens `path` for reading without following a final symbolic link.
+/// Opens `path` for reading; with [`SymlinkPolicy::Record`] a final symbolic
+/// link is never followed.
 #[cfg(unix)]
-fn open_regular(path: &Path) -> Result<File, IssueKind> {
+fn open_regular(path: &Path, symlinks: SymlinkPolicy) -> Result<File, IssueKind> {
     use std::os::unix::fs::OpenOptionsExt;
     // O_NOFOLLOW: fail instead of opening a link's target.
     // O_NONBLOCK: a FIFO swapped in after listing cannot block the scan; it
     // has no effect on reads of regular files.
+    let mut flags = libc::O_NONBLOCK;
+    if symlinks == SymlinkPolicy::Record {
+        flags |= libc::O_NOFOLLOW;
+    }
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(flags)
         .open(path)
         .map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) {
+            if e.raw_os_error() == Some(libc::ELOOP) && symlinks == SymlinkPolicy::Record {
                 // O_NOFOLLOW reports a symlink as ELOOP.
                 IssueKind::TypeChangedDuringScan
             } else {
@@ -295,20 +526,20 @@ fn open_regular(path: &Path) -> Result<File, IssueKind> {
         })
 }
 
-/// Opens `path` for reading without following a reparse point.
+/// Opens `path` for reading; with [`SymlinkPolicy::Record`] a reparse point
+/// is opened itself (and then rejected by the type check), not its target.
 #[cfg(windows)]
-fn open_regular(path: &Path) -> Result<File, IssueKind> {
+fn open_regular(path: &Path, symlinks: SymlinkPolicy) -> Result<File, IssueKind> {
     use std::os::windows::fs::OpenOptionsExt;
-    // FILE_FLAG_OPEN_REPARSE_POINT (winbase.h): open a symlink or junction
-    // itself instead of its target; the type check on the handle then
-    // rejects it. Rust's default share mode lets other processes keep
-    // reading, writing and deleting while we hash.
+    // FILE_FLAG_OPEN_REPARSE_POINT (winbase.h). Rust's default share mode
+    // lets other processes keep reading, writing and deleting while we hash.
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(IssueKind::Io)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    if symlinks == SymlinkPolicy::Record {
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path).map_err(IssueKind::Io)
 }
 
 #[cfg(unix)]
@@ -382,13 +613,28 @@ mod tests {
     }
 
     fn scan_dir(dir: &Path) -> Snapshot {
-        scan(dir, ScanOptions::default()).expect("root is usable")
+        scan(dir, &ScanPolicy::default()).expect("root is usable")
+    }
+
+    fn scan_with(dir: &Path, policy: ScanPolicy) -> Snapshot {
+        scan(dir, &policy).expect("root is usable")
+    }
+
+    fn paths(snapshot: &Snapshot) -> Vec<String> {
+        snapshot.entries.keys().map(ToString::to_string).collect()
     }
 
     fn file_digest(snapshot: &Snapshot, path: &str) -> String {
         match &snapshot.entries[&rel(path)] {
             Record::File { digest, .. } => digest.to_string(),
             other => panic!("{path} is not a file: {other:?}"),
+        }
+    }
+
+    fn excluding(patterns: &[&str]) -> ScanPolicy {
+        ScanPolicy {
+            exclude: patterns.iter().map(|p| (*p).to_owned()).collect(),
+            ..ScanPolicy::default()
         }
     }
 
@@ -410,10 +656,8 @@ mod tests {
 
         let snap = scan_dir(dir.path());
         assert!(snap.is_complete(), "{:?}", snap.issues);
-
-        let paths: Vec<String> = snap.entries.keys().map(ToString::to_string).collect();
         assert_eq!(
-            paths,
+            paths(&snap),
             [
                 "abc.txt",
                 "empty-dir",
@@ -424,7 +668,7 @@ mod tests {
         );
         assert_eq!(file_digest(&snap, "abc.txt"), ABC_SHA256);
         assert_eq!(file_digest(&snap, "sub/deeper/empty"), EMPTY_SHA256);
-        assert_eq!(snap.entries[&rel("sub")], Record::Directory);
+        assert_eq!(snap.entries[&rel("sub")], Record::Directory {});
         assert!(matches!(
             snap.entries[&rel("abc.txt")],
             Record::File { size: 3, .. }
@@ -445,9 +689,28 @@ mod tests {
     }
 
     #[test]
+    fn max_file_size_reports_instead_of_hashing() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("big"), "abcd").unwrap();
+        fs::write(dir.path().join("small"), "abc").unwrap();
+        let policy = ScanPolicy {
+            max_file_size: Some(3),
+            ..ScanPolicy::default()
+        };
+
+        let snap = scan_with(dir.path(), policy);
+        assert_eq!(paths(&snap), ["small"]);
+        assert_eq!(snap.issues.len(), 1);
+        assert!(matches!(
+            snap.issues[0].kind,
+            IssueKind::TooLarge { size: 4, limit: 3 }
+        ));
+    }
+
+    #[test]
     fn missing_root_is_fatal() {
         let dir = TempDir::new().unwrap();
-        let err = scan(&dir.path().join("nope"), ScanOptions::default()).unwrap_err();
+        let err = scan(&dir.path().join("nope"), &ScanPolicy::default()).unwrap_err();
         assert!(matches!(err, ScanError::RootUnavailable { .. }), "{err}");
     }
 
@@ -456,8 +719,130 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("f");
         fs::write(&file, "x").unwrap();
-        let err = scan(&file, ScanOptions::default()).unwrap_err();
+        let err = scan(&file, &ScanPolicy::default()).unwrap_err();
         assert!(matches!(err, ScanError::RootNotDirectory { .. }), "{err}");
+    }
+
+    #[test]
+    fn exclude_by_name_and_by_path() {
+        let dir = TempDir::new().unwrap();
+        for d in ["logs", "src/build", "build"] {
+            fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        for f in [
+            "app.log",
+            "logs/x.log",
+            "logs/keep.txt",
+            "src/main.rs",
+            "src/build/out.o",
+            "build/top.o",
+        ] {
+            fs::write(dir.path().join(f), "x").unwrap();
+        }
+
+        // "*.log" matches names at any depth; "/build" only at the top.
+        let snap = scan_with(dir.path(), excluding(&["*.log", "/build"]));
+        assert!(snap.is_complete());
+        assert_eq!(
+            paths(&snap),
+            [
+                "logs",
+                "logs/keep.txt",
+                "src",
+                "src/build",
+                "src/build/out.o",
+                "src/main.rs"
+            ]
+        );
+
+        // A name pattern on a directory excludes the whole subtree.
+        let snap = scan_with(dir.path(), excluding(&["build"]));
+        assert!(!paths(&snap).iter().any(|p| p.contains("build")));
+
+        // `*` does not cross `/`, `**` does.
+        let snap = scan_with(dir.path(), excluding(&["src/*"]));
+        assert!(paths(&snap).contains(&"src".to_owned()));
+        assert!(!paths(&snap).iter().any(|p| p.starts_with("src/")));
+        let snap = scan_with(dir.path(), excluding(&["**/*.o"]));
+        assert!(!paths(&snap).iter().any(|p| p.ends_with(".o")));
+    }
+
+    #[test]
+    fn invalid_excludes_are_rejected() {
+        for bad in ["", "/", r"logs\*.log", "../x", "a/./b", "[unclosed"] {
+            let err = excluding(&[bad]).validate().unwrap_err();
+            assert!(matches!(err, ScanError::InvalidExclude { .. }), "{bad:?}");
+        }
+        assert!(excluding(&["*.tmp", "a/**/b", "/top"]).validate().is_ok());
+    }
+
+    #[test]
+    fn subtree_scan() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        fs::write(dir.path().join("a/b/f"), "abc").unwrap();
+        fs::write(dir.path().join("a/g"), "").unwrap();
+        fs::write(dir.path().join("other"), "").unwrap();
+        let scanner = Scanner::new(dir.path(), excluding(&["g"])).unwrap();
+
+        let snap = scanner.scan_subtree(&rel("a"));
+        assert_eq!(paths(&snap), ["a", "a/b", "a/b/f"]);
+        let snap = scanner.scan_subtree(&rel("a/b/f"));
+        assert_eq!(paths(&snap), ["a/b/f"]);
+        assert!(scanner.scan_subtree(&rel("missing")).entries.is_empty());
+        assert!(scanner.scan_subtree(&rel("a/g")).entries.is_empty());
+        assert!(scanner.is_excluded(&rel("a/g")));
+        assert!(!scanner.is_excluded(&rel("a")));
+    }
+
+    #[test]
+    fn issue_coverage() {
+        let issue = ScanIssue {
+            path: Some(rel("locked")),
+            kind: IssueKind::ChangedDuringScan,
+        };
+        assert!(issue.covers(&rel("locked")));
+        assert!(issue.covers(&rel("locked/inner")));
+        assert!(!issue.covers(&rel("locked-not")));
+        let root_issue = ScanIssue {
+            path: None,
+            kind: IssueKind::ChangedDuringScan,
+        };
+        assert!(root_issue.covers(&rel("anything")));
+    }
+
+    #[test]
+    fn record_json_forms() {
+        let json = |r: &Record| serde_json::to_string(r).unwrap();
+        let file = Record::File {
+            size: 3,
+            digest: crate::hash::Algorithm::Sha256
+                .hash_reader(&mut &b"abc"[..])
+                .unwrap()
+                .digest,
+        };
+        assert_eq!(
+            json(&file),
+            format!(r#"{{"type":"file","size":3,"digest":"{ABC_SHA256}"}}"#)
+        );
+        assert_eq!(json(&Record::Directory {}), r#"{"type":"directory"}"#);
+        assert_eq!(
+            json(&Record::Symlink {
+                target: PathBuf::from("../t")
+            }),
+            r#"{"type":"symlink","target":"../t"}"#
+        );
+        assert_eq!(
+            json(&Record::Special {
+                kind: SpecialKind::Fifo
+            }),
+            r#"{"type":"special","kind":"fifo"}"#
+        );
+        for r in [file, Record::Directory {}] {
+            assert_eq!(serde_json::from_str::<Record>(&json(&r)).unwrap(), r);
+        }
+        assert!(serde_json::from_str::<Record>(r#"{"type":"directory","x":1}"#).is_err());
+        assert!(serde_json::from_str::<Record>(r#"{"type":"file","size":1}"#).is_err());
     }
 
     #[test]
@@ -510,6 +895,17 @@ mod tests {
         }
     }
 
+    /// Compares canonical forms: Windows may report targets as `\\?\…`.
+    fn assert_link_to(snapshot: &Snapshot, link: &str, expected: &Path) {
+        match &snapshot.entries[&rel(link)] {
+            Record::Symlink { target } => assert_eq!(
+                fs::canonicalize(target).unwrap(),
+                fs::canonicalize(expected).unwrap()
+            ),
+            other => panic!("{link} is not a symlink: {other:?}"),
+        }
+    }
+
     #[test]
     fn symlinks_are_recorded_not_followed() {
         let outside = TempDir::new().unwrap();
@@ -531,15 +927,41 @@ mod tests {
         assert_link_to(&snap, "dir-link", outside.path());
     }
 
-    /// Compares canonical forms: Windows may report targets as `\\?\…`.
-    fn assert_link_to(snapshot: &Snapshot, link: &str, expected: &Path) {
-        match &snapshot.entries[&rel(link)] {
-            Record::Symlink { target } => assert_eq!(
-                fs::canonicalize(target).unwrap(),
-                fs::canonicalize(expected).unwrap()
-            ),
-            other => panic!("{link} is not a symlink: {other:?}"),
+    #[test]
+    fn follow_policy_looks_behind_links() {
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret"), "abc").unwrap();
+        let dir = TempDir::new().unwrap();
+        if try_symlink(outside.path(), &dir.path().join("dir-link"), true).is_none() {
+            return;
         }
+        let policy = ScanPolicy {
+            symlinks: SymlinkPolicy::Follow,
+            ..ScanPolicy::default()
+        };
+
+        let snap = scan_with(dir.path(), policy);
+        assert!(snap.is_complete(), "{:?}", snap.issues);
+        assert_eq!(snap.entries[&rel("dir-link")], Record::Directory {});
+        assert_eq!(file_digest(&snap, "dir-link/secret"), ABC_SHA256);
+    }
+
+    #[test]
+    fn follow_policy_detects_loops() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        if try_symlink(dir.path(), &dir.path().join("a/loop"), true).is_none() {
+            return;
+        }
+        let policy = ScanPolicy {
+            symlinks: SymlinkPolicy::Follow,
+            ..ScanPolicy::default()
+        };
+
+        // Must terminate, reporting the loop instead of recursing forever.
+        let snap = scan_with(dir.path(), policy);
+        assert_eq!(snap.issues.len(), 1, "{:?}", snap.issues);
+        assert_eq!(snap.issues[0].path, Some(rel("a/loop")));
     }
 
     #[test]
@@ -551,7 +973,7 @@ mod tests {
         if try_symlink(&dir.path().join("target"), &link, false).is_none() {
             return;
         }
-        let result = hash_file(&link, Algorithm::Sha256);
+        let result = hash_file(&link, &ScanPolicy::default());
         assert!(
             matches!(result, Err(IssueKind::TypeChangedDuringScan)),
             "{result:?}"
@@ -685,28 +1107,34 @@ mod tests {
             chmod(&locked, 0o700);
 
             // The directory itself is listed, its contents are unknown.
-            assert_eq!(snap.entries[&rel("locked")], Record::Directory);
+            assert_eq!(snap.entries[&rel("locked")], Record::Directory {});
             assert!(!snap.entries.contains_key(&rel("locked/hidden")));
             assert_eq!(snap.issues.len(), 1, "{:?}", snap.issues);
             assert_eq!(snap.issues[0].path, Some(rel("locked")));
         }
 
-        #[test]
-        fn fifo_is_recorded_and_never_opened() {
-            let dir = TempDir::new().unwrap();
+        fn mkfifo(path: &Path) {
             // mkfifo(3) would need unsafe FFI; the coreutils tool is enough.
             let status = std::process::Command::new("mkfifo")
-                .arg(dir.path().join("pipe"))
+                .arg(path)
                 .status()
                 .unwrap();
             assert!(status.success());
+        }
+
+        #[test]
+        fn fifo_is_recorded_and_never_opened() {
+            let dir = TempDir::new().unwrap();
+            mkfifo(&dir.path().join("pipe"));
 
             // Would hang forever if the scanner opened the FIFO for reading.
             let snap = scan_dir(dir.path());
             assert!(snap.is_complete(), "{:?}", snap.issues);
             assert_eq!(
                 snap.entries[&rel("pipe")],
-                Record::Special(SpecialKind::Fifo)
+                Record::Special {
+                    kind: SpecialKind::Fifo
+                }
             );
         }
 
@@ -715,13 +1143,9 @@ mod tests {
             // The listing said "file", but a FIFO is there when we open it.
             let dir = TempDir::new().unwrap();
             let pipe = dir.path().join("pipe");
-            let status = std::process::Command::new("mkfifo")
-                .arg(&pipe)
-                .status()
-                .unwrap();
-            assert!(status.success());
+            mkfifo(&pipe);
 
-            let result = hash_file(&pipe, Algorithm::Sha256);
+            let result = hash_file(&pipe, &ScanPolicy::default());
             assert!(
                 matches!(result, Err(IssueKind::TypeChangedDuringScan)),
                 "{result:?}"
