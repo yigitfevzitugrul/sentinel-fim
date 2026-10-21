@@ -1,0 +1,19 @@
+[package]
+name = "sentinel-fim"
+version = "0.1.0"
+edition = "2024"
+# Required by sha2 0.11, notify 8 and globset 0.4.20.
+rust-version = "1.88"
+description = "A file integrity monitor: baseline, scan and detect file changes."
+license = "MIT OR Apache-2.0"
+authors = ["Yiğit Fevzi Tuğrul"]
+keywords = ["fim", "integrity", "security", "hash", "monitor"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+# Default features (alloc, oid) are not needed; keep the dependency tree small.
+sha2 = { version = "0.11", default-features = false }
+
+[lints.rust]
+# A security tool has no business using unsafe code.
+unsafe_code = "forbid"

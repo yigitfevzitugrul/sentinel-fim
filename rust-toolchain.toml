@@ -1,0 +1,6 @@
+# Pins the toolchain used for development so every machine builds with the same compiler.
+# The minimum supported version (MSRV) is declared separately as `rust-version` in Cargo.toml.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
