@@ -3,7 +3,7 @@
 //! Data is read through a fixed-size buffer, so memory use does not depend on
 //! the size of the input. The algorithm is chosen at runtime through
 //! [`Algorithm`] (it will be recorded in the baseline), while each concrete
-//! implementation sits behind the private [`Hasher`] trait.
+//! implementation sits behind the private `Hasher` trait.
 
 use std::fmt;
 use std::io::{self, Read};
