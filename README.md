@@ -1,5 +1,7 @@
 # Sentinel FIM
 
+**English** | [Türkçe](README.tr.md)
+
 A file integrity monitor for Linux and Windows. It records a trusted
 **baseline** of a directory tree (SHA-256 of every file, plus directories,
 symlinks and special files) and reports what was **added, removed, modified
