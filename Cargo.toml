@@ -38,5 +38,15 @@ libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"
+blake3 = "1"
+criterion = "0.8"
 predicates = "3"
 proptest = "1"
+
+[[bench]]
+name = "hashing"
+harness = false
+
+[[bench]]
+name = "scan"
+harness = false

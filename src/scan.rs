@@ -26,7 +26,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::hash::{Algorithm, Digest};
+use crate::hash::{Algorithm, BUFFER_SIZE, Digest};
 use crate::path::{PathRepr, RelPath, RelPathError};
 
 /// What to do with symbolic links (and Windows junctions).
@@ -318,7 +318,12 @@ impl Scanner {
         })
     }
 
-    fn visit(&self, entry: &walkdir::DirEntry, path: RelPath) -> Result<Entry, ScanIssue> {
+    fn visit(
+        &self,
+        entry: &walkdir::DirEntry,
+        path: RelPath,
+        buffer: &mut [u8],
+    ) -> Result<Entry, ScanIssue> {
         // From the directory listing; for `Record` it describes the entry
         // itself, for `Follow` the link target.
         let file_type = entry.file_type();
@@ -329,7 +334,7 @@ impl Scanner {
         } else if file_type.is_dir() {
             Ok(Record::Directory {})
         } else if file_type.is_file() {
-            hash_file(entry.path(), &self.policy)
+            hash_file(entry.path(), &self.policy, buffer)
         } else {
             Ok(Record::Special {
                 kind: special_kind(file_type),
@@ -350,6 +355,8 @@ impl Scanner {
 pub struct Walk<'a> {
     scanner: &'a Scanner,
     inner: walkdir::IntoIter,
+    /// Read buffer shared by all files of this walk.
+    buffer: Vec<u8>,
 }
 
 impl<'a> Walk<'a> {
@@ -362,7 +369,11 @@ impl<'a> Walk<'a> {
             .min_depth(min_depth)
             .sort_by_file_name()
             .into_iter();
-        Walk { scanner, inner }
+        Walk {
+            scanner,
+            inner,
+            buffer: vec![0; BUFFER_SIZE],
+        }
     }
 
     fn walk_issue(&self, error: walkdir::Error) -> ScanIssue {
@@ -404,7 +415,7 @@ impl Iterator for Walk<'_> {
                 }
                 continue;
             }
-            return Some(self.scanner.visit(&entry, path));
+            return Some(self.scanner.visit(&entry, path, &mut self.buffer));
         }
     }
 }
@@ -467,7 +478,7 @@ impl Excludes {
 }
 
 /// Hashes a regular file, guarding against swaps and concurrent changes.
-fn hash_file(path: &Path, policy: &ScanPolicy) -> Result<Record, IssueKind> {
+fn hash_file(path: &Path, policy: &ScanPolicy, buffer: &mut [u8]) -> Result<Record, IssueKind> {
     let mut file = open_regular(path, policy.symlinks)?;
 
     let before = file.metadata()?;
@@ -483,7 +494,9 @@ fn hash_file(path: &Path, policy: &ScanPolicy) -> Result<Record, IssueKind> {
         });
     }
 
-    let output = policy.algorithm.hash_reader(&mut file)?;
+    let output = policy
+        .algorithm
+        .hash_reader_with_buffer(&mut file, buffer)?;
 
     let after = file.metadata()?;
     if !is_stable(
@@ -973,7 +986,7 @@ mod tests {
         if try_symlink(&dir.path().join("target"), &link, false).is_none() {
             return;
         }
-        let result = hash_file(&link, &ScanPolicy::default());
+        let result = hash_file(&link, &ScanPolicy::default(), &mut [0; 64]);
         assert!(
             matches!(result, Err(IssueKind::TypeChangedDuringScan)),
             "{result:?}"
@@ -1145,7 +1158,7 @@ mod tests {
             let pipe = dir.path().join("pipe");
             mkfifo(&pipe);
 
-            let result = hash_file(&pipe, &ScanPolicy::default());
+            let result = hash_file(&pipe, &ScanPolicy::default(), &mut [0; 64]);
             assert!(
                 matches!(result, Err(IssueKind::TypeChangedDuringScan)),
                 "{result:?}"

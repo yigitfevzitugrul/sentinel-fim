@@ -15,7 +15,7 @@ use crate::hex;
 
 /// Read buffer size. Large enough to keep syscall overhead low, small enough
 /// to be irrelevant for memory use.
-const BUFFER_SIZE: usize = 64 * 1024;
+pub const BUFFER_SIZE: usize = 64 * 1024;
 
 /// Supported digest algorithms.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -44,8 +44,31 @@ impl Algorithm {
     /// Returns any I/O error other than [`io::ErrorKind::Interrupted`], which
     /// is retried. A partial read is never turned into a digest.
     pub fn hash_reader<R: Read + ?Sized>(self, reader: &mut R) -> io::Result<HashOutput> {
+        // Heap-allocated: 64 KiB on the stack is avoidable pressure on
+        // threads with small stacks.
+        let mut buffer = vec![0u8; BUFFER_SIZE];
+        self.hash_reader_with_buffer(reader, &mut buffer)
+    }
+
+    /// Like [`Algorithm::hash_reader`], but reads through the caller's
+    /// `buffer`, so hashing many small files needs no allocation per file.
+    ///
+    /// # Errors
+    ///
+    /// As [`Algorithm::hash_reader`].
+    ///
+    /// # Panics
+    ///
+    /// If `buffer` is empty: every read would return 0 and the input would
+    /// silently hash as empty.
+    pub fn hash_reader_with_buffer<R: Read + ?Sized>(
+        self,
+        reader: &mut R,
+        buffer: &mut [u8],
+    ) -> io::Result<HashOutput> {
+        assert!(!buffer.is_empty(), "hash buffer must not be empty");
         match self {
-            Algorithm::Sha256 => stream::<Sha256Hasher, R>(reader),
+            Algorithm::Sha256 => stream::<Sha256Hasher, R>(reader, buffer),
         }
     }
 }
@@ -134,15 +157,15 @@ impl Hasher for Sha256Hasher {
 }
 
 /// Feeds `reader` into a fresh `H` through a fixed-size buffer.
-fn stream<H: Hasher, R: Read + ?Sized>(reader: &mut R) -> io::Result<HashOutput> {
+fn stream<H: Hasher, R: Read + ?Sized>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> io::Result<HashOutput> {
     let mut hasher = H::default();
-    // Heap-allocated: 64 KiB on the stack is avoidable pressure on threads
-    // with small stacks, which a parallel scanner may use later.
-    let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut bytes_read: u64 = 0;
 
     loop {
-        match reader.read(&mut buffer) {
+        match reader.read(buffer) {
             Ok(0) => break,
             Ok(n) => {
                 hasher.update(&buffer[..n]);
@@ -295,6 +318,25 @@ mod tests {
         let mut reader = FailAfter { data: b"partial" };
         let err = Algorithm::Sha256.hash_reader(&mut reader).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn reused_small_buffer_gives_same_digest() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        let whole = Algorithm::Sha256.hash_reader(&mut data.as_slice()).unwrap();
+        let mut buffer = [0u8; 7];
+        for _ in 0..2 {
+            let out = Algorithm::Sha256
+                .hash_reader_with_buffer(&mut data.as_slice(), &mut buffer)
+                .unwrap();
+            assert_eq!(out, whole);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be empty")]
+    fn empty_buffer_is_rejected() {
+        let _ = Algorithm::Sha256.hash_reader_with_buffer(&mut &b"abc"[..], &mut []);
     }
 
     #[test]

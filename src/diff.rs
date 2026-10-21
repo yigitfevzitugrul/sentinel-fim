@@ -1,5 +1,6 @@
 //! Comparing a scan with a baseline.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -74,47 +75,82 @@ pub fn compare_within(
     scope: Option<&RelPath>,
     snapshot: &Snapshot,
 ) -> Diff {
-    let in_scope = |path: &RelPath| scope.is_none_or(|s| path.starts_with(s));
     let mut diff = Diff::default();
-
-    for (path, before) in baseline.iter().filter(|(p, _)| in_scope(p)) {
-        match snapshot.entries.get(path) {
-            Some(after) => {
-                if let Some(kind) = classify(before, after) {
-                    diff.changes.push(Change {
-                        path: path.clone(),
-                        kind,
-                        before: Some(before.clone()),
-                        after: Some(after.clone()),
-                    });
-                }
-            }
-            None if snapshot.issues.iter().any(|i| i.covers(path)) => {
-                diff.unverified.push(path.clone());
-            }
-            None => diff.changes.push(Change {
+    let missing = |diff: &mut Diff, path: &RelPath, before: &Record| {
+        if snapshot.issues.iter().any(|i| i.covers(path)) {
+            diff.unverified.push(path.clone());
+        } else {
+            diff.changes.push(Change {
                 path: path.clone(),
                 kind: ChangeKind::Removed,
                 before: Some(before.clone()),
                 after: None,
-            }),
-        }
-    }
-
-    for (path, after) in snapshot.entries.iter().filter(|(p, _)| in_scope(p)) {
-        if !baseline.contains_key(path) {
-            diff.changes.push(Change {
-                path: path.clone(),
-                kind: ChangeKind::Added,
-                before: None,
-                after: Some(after.clone()),
             });
         }
-    }
+    };
+    let added = |diff: &mut Diff, path: &RelPath, after: &Record| {
+        diff.changes.push(Change {
+            path: path.clone(),
+            kind: ChangeKind::Added,
+            before: None,
+            after: Some(after.clone()),
+        });
+    };
 
-    diff.changes
-        .sort_by(|a, b| a.path.cmp(&b.path).then(a.kind.cmp(&b.kind)));
+    // Both maps are sorted: a single merge pass, output already in order.
+    let mut old = scoped(baseline, scope).peekable();
+    let mut new = scoped(&snapshot.entries, scope).peekable();
+    loop {
+        match (old.peek(), new.peek()) {
+            (None, None) => break,
+            (Some(&(path, before)), None) => {
+                missing(&mut diff, path, before);
+                old.next();
+            }
+            (None, Some(&(path, after))) => {
+                added(&mut diff, path, after);
+                new.next();
+            }
+            (Some(&(old_path, before)), Some(&(new_path, after))) => match old_path.cmp(new_path) {
+                Ordering::Less => {
+                    missing(&mut diff, old_path, before);
+                    old.next();
+                }
+                Ordering::Greater => {
+                    added(&mut diff, new_path, after);
+                    new.next();
+                }
+                Ordering::Equal => {
+                    if let Some(kind) = classify(before, after) {
+                        diff.changes.push(Change {
+                            path: old_path.clone(),
+                            kind,
+                            before: Some(before.clone()),
+                            after: Some(after.clone()),
+                        });
+                    }
+                    old.next();
+                    new.next();
+                }
+            },
+        }
+    }
     diff
+}
+
+/// Entries of `map` at or below `scope`. Descendants of a path directly
+/// follow it in component-wise order, so this is a contiguous range.
+fn scoped<'a>(
+    map: &'a BTreeMap<RelPath, Record>,
+    scope: Option<&'a RelPath>,
+) -> Box<dyn Iterator<Item = (&'a RelPath, &'a Record)> + 'a> {
+    match scope {
+        None => Box::new(map.iter()),
+        Some(scope) => Box::new(
+            map.range(scope.clone()..)
+                .take_while(move |(path, _)| path.starts_with(scope)),
+        ),
+    }
 }
 
 fn classify(before: &Record, after: &Record) -> Option<ChangeKind> {
